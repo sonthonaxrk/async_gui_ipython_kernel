@@ -1,0 +1,10 @@
+{
+	"argv": [
+		"python",
+		"-m",
+		"async_gui_ipython_kernel",
+		"-f",
+		"{connection_file}"
+	],
+	"display_name":"Async GUI Kernel"
+}
