@@ -128,7 +128,7 @@ class AsyncGUIKernel(IPythonKernel):
             new_args = args
 
         if new_args and msg['header']['msg_type'] in self.comm_msg_types:
-            return dispatch(*new_args)
+            return self.io_loop.add_callback(dispatch, *new_args)
         else:
             idx = next(self._message_counter)
 
@@ -150,8 +150,8 @@ class AsyncGUIKernel(IPythonKernel):
         # associated with.
 
         # Don't change the output if the message is from a comm
-        if parent['header']['msg_type'] not in self.comm_msg_types:
-            super().set_parent(ident, parent)
+        #if parent['header']['msg_type'] not in self.comm_msg_types:
+        super().set_parent(ident, parent)
 
 
 if __name__ == '__main__':
