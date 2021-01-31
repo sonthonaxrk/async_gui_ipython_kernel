@@ -4,10 +4,6 @@ import sys
 from typing import Any, Tuple
 from tornado import gen
 from ipykernel.ipkernel import IPythonKernel
-from devtools import pformat
-from ipykernel.kernelbase import (
-    CONTROL_PRIORITY, SHELL_PRIORITY, ABORT_PRIORITY
-)
 
 
 class AsyncGUIKernel(IPythonKernel):
@@ -33,8 +29,8 @@ class AsyncGUIKernel(IPythonKernel):
     @gen.coroutine
     def dispatch_shell(self, stream, msg: dict, idents):
         """dispatch shell requests"""
-        msg_type = msg['header']['msg_type']
-
+        # Set the parent message for side effects.
+        self.set_parent(idents, msg)
         self._publish_status('busy')
 
         if self._aborting:
@@ -44,6 +40,8 @@ class AsyncGUIKernel(IPythonKernel):
             # handling the next request
             stream.flush(zmq.POLLOUT)
             return
+
+        msg_type = msg['header']['msg_type']
 
         # Print some info about this message and leave a '--->' marker, so it's
         # easier to trace visually the message chain when debugging.  Each
@@ -84,6 +82,8 @@ class AsyncGUIKernel(IPythonKernel):
     def dispatch_control(self, msg: dict, idents):
         self.log.debug("Control received: %s", msg)
 
+        # Set the parent message for side effects.
+        self.set_parent(idents, msg)
         self._publish_status('busy')
         if self._aborting:
             self._send_abort_reply(self.control_stream, msg, idents)
@@ -113,35 +113,35 @@ class AsyncGUIKernel(IPythonKernel):
         Changes the schedule_dispatch dispatch method to
         always dispatch comm events.
         """
-        # quick and dirty checks for message type
-        if priority == SHELL_PRIORITY:
+
+        # Only dispatch_shell messages have two args
+        if len(args) == 2:
             stream, unparsed_msg = args
             indent, msg = self._parse_message(unparsed_msg)
             new_args = (stream, msg, indent)
-            if new_args and msg['header']['msg_type'] in self.comm_msg_types:
-                # Dispatch now
-                return dispatch(*new_args)
-        elif priority == CONTROL_PRIORITY: # CONTROL_PRIORITY
+        elif len(args) == 1:
             # One arg
             (unparsed_msg,) = args
             indent, msg = self._parse_message(unparsed_msg)
             new_args = (msg, indent)
-        elif priority == ABORT_PRIORITY: # ABORT_PRIORITY
+        elif len(args) == 0:
             new_args = args
 
-        # Anything else, keep things the same.
-        idx = next(self._message_counter)
+        if new_args and msg['header']['msg_type'] in self.comm_msg_types:
+            return dispatch(*new_args)
+        else:
+            idx = next(self._message_counter)
 
-        self.msg_queue.put_nowait(
-            (
-                priority,
-                idx,
-                dispatch,
-                new_args,
+            self.msg_queue.put_nowait(
+                (
+                    priority,
+                    idx,
+                    dispatch,
+                    new_args,
+                )
             )
-        )
-        # ensure the eventloop wakes up
-        self.io_loop.add_callback(lambda: None)
+            # ensure the eventloop wakes up
+            self.io_loop.add_callback(lambda: None)
 
     def set_parent(self, ident, parent):
         # The last message sent will set what cell output
@@ -150,8 +150,8 @@ class AsyncGUIKernel(IPythonKernel):
         # associated with.
 
         # Don't change the output if the message is from a comm
-        if msg['header']['msg_type'] not in self.comm_msg_types:
-            super().set_parent(indent, parent)
+        if parent['header']['msg_type'] not in self.comm_msg_types:
+            super().set_parent(ident, parent)
 
 
 if __name__ == '__main__':
