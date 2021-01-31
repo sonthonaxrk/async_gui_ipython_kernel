@@ -14,7 +14,13 @@ class AsyncGUIKernel(IPythonKernel):
     )
 
     # Since this is not explicitly defined in the parent class
-    comm_msg_types = [ 'comm_open', 'comm_msg', 'comm_close' ]
+    comm_msg_types = [ 'comm_msg' ]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.log = self.log.getChild('AsyncGUIKernel')
+        self.log.setLevel(logging.INFO)
+        #self.log.addHandler(logging.StreamHandler(sys.__stderr__))
 
     def _parse_message(self, msg) -> Tuple[Any, dict]:
         """dispatch control requests"""
