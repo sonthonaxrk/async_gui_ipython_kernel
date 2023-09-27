@@ -11,10 +11,8 @@ from ipykernel.kernelspec import (
     InstallIPythonKernelSpecApp,
     make_ipkernel_cmd, _is_debugpy_available)
 from traitlets import Unicode
-
-from argparse import ArgumentParser
-from pathlib import Path
-
+from tornado.queues import Queue
+import asyncio
 
 
 class AsyncGUIKernel(IPythonKernel):
@@ -24,13 +22,28 @@ class AsyncGUIKernel(IPythonKernel):
         'when other cells are running.'
     )
 
-    # Since this is not explicitly defined in the parent class
-    comm_msg_types = [ 'comm_msg' ]
+    # Types of messages to push into alternative channels.
+    # Default channel is 0.
+    msg_type_channels = dict(
+        comm_msg = 1)
+
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.log = self.log.getChild('AsyncGUIKernel')
         self.log.setLevel(logging.INFO)
+
+
+    def _get_channels(self):
+        return set([0] + list(self.msg_type_channels.values()))
+
+
+    def start(self):
+        super().start()
+        self.msg_queues = {k: Queue() for k in self._get_channels()}
+
+        # a dirty hack to make `self.enter_eventloop` work with multiple queues
+        setattr(self.msg_queue, 'qsize', lambda: any(map(Queue.qsize, self.msg_queues)))
 
 
     def _parse_message(self, msg) -> Tuple[Any, dict]:
@@ -53,11 +66,9 @@ class AsyncGUIKernel(IPythonKernel):
         idx = next(self._message_counter)
         indent, msg = self._parse_message(args[0])
         msg_type = (msg.get('header', dict()).get('msg_type', ''))
+        channel = self.msg_type_channels.get(msg_type, 0)
 
-        if msg_type in self.comm_msg_types:
-            return self.io_loop.add_callback(dispatch, *args)
-
-        self.msg_queue.put_nowait(
+        self.msg_queues[channel].put_nowait(
             (
                 idx,
                 dispatch,
@@ -69,14 +80,86 @@ class AsyncGUIKernel(IPythonKernel):
         self.io_loop.add_callback(lambda: None)
 
 
+    async def _process_one_immediately(self):
+        # Pick a request from any channel and exit
+        msg = None
+        for k in self._get_channels():
+            try:
+                msg =  self.msg_queues[i].get_nowait()
+                break
+            except (asyncio.QueueEmpty, QueueEmpty):
+                pass
+
+        t, dispatch, args = msg
+        await dispatch(*args)
+
+
+    async def _fetch_request(self, channel):
+        t, dispatch, args = await self.msg_queues[channel].get()
+        return dispatch(*args)
+
+
+    def _fill_requests(self, channels):
+        return {
+            asyncio.create_task(self._fetch_request(channel)): channel
+            for channel in channels}
+
+
+    async def process_one(self, wait=True):
+        """Process 'one' request
+
+        Returns None if no message was handled.
+
+        While the first request is being processed it also processes requests in
+        another channels.
+        """
+
+        if not wait:
+            return self._process_one_immediately()
+
+
+        # Here we do the following things:
+        # - await on all message queues for a new request
+        # - as soon as we get a request we await on it (along with the remaining message queues)
+        # - as soon as we process the request we await on it's message queue again
+        #
+        # When we finish processing all the requests and return to awaiting on all channels again, we exit.
+        # If we use single message queue we process exactly one request.
+        # If we use more queues, we might process multiple requests in one go.
+
+        channels = self._get_channels()
+        requests = self._fill_requests(channels)
+        workers = {}
+
+        while True:
+            done, pending = await asyncio.wait(
+                list(requests.keys()) + list(workers.keys()),
+                return_when = asyncio.FIRST_COMPLETED)
+
+            for t in done:
+                if t in requests:
+                    workers[asyncio.create_task(t.result())] = requests[t]
+
+            requests = {k: v for k, v in requests.items() if k not in done}
+            workers = {k: v for k, v in workers.items() if k not in done}
+
+            if len(workers) == 0:
+                for t in requests.keys():
+                    t.cancel()
+                break
+
+            requests.update(
+                self._fill_requests(
+                    channels - set(workers.values()) - set(requests.values())))
+
+
     def set_parent(self, ident, parent, channel="shell"):
         """Overridden from parent to tell the display hook and output streams
         about the parent message.
         """
 
         # Don't change the output if the message is from a comm
-        #if parent['header']['msg_type'] not in self.comm_msg_types:
-        if parent['header']['msg_type'] not in self.comm_msg_types:
+        if parent['header']['msg_type'] not in self.msg_type_channels:
             super().set_parent(ident, parent, channel)
             if channel == "shell":
                 self.shell.set_parent(parent)
