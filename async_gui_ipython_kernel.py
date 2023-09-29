@@ -64,9 +64,12 @@ class AsyncGUIKernel(IPythonKernel):
         """
 
         idx = next(self._message_counter)
-        indent, msg = self._parse_message(args[0])
-        msg_type = (msg.get('header', dict()).get('msg_type', ''))
-        channel = self.msg_type_channels.get(msg_type, 0)
+        channel = 0
+
+        if len(args) >= 1:
+            indent, msg = self._parse_message(args[0])
+            msg_type = (msg.get('header', dict()).get('msg_type', ''))
+            channel = self.msg_type_channels.get(msg_type, 0)
 
         self.msg_queues[channel].put_nowait(
             (
