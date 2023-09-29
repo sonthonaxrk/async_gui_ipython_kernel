@@ -17,8 +17,9 @@ Being able to wait on user input in Jupyter opens up possibilities for building 
 ## Quickstart
 
     pip install git+git://github.com/sonthonaxrk/async_gui_ipython_kernel.git#egg=async_gui_ipython_kernel
-    
-Make sure to set your kernel to 'Async GUI kernel'.
+    python -m async_gui_ipython_kernel install
+
+Make sure to set your kernel to `Async GUI Python 3 (async_gui_ipython_kernel)`.
 
 
 ## Disclaimer

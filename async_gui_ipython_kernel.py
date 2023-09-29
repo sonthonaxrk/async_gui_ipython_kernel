@@ -1,9 +1,18 @@
+import logging
 import zmq
 import sys
 
 from typing import Any, Tuple
 from tornado import gen
 from ipykernel.ipkernel import IPythonKernel
+from ipykernel.kernelapp import IPKernelApp
+from ipykernel import kernelspec
+from ipykernel.kernelspec import (
+    InstallIPythonKernelSpecApp,
+    make_ipkernel_cmd, _is_debugpy_available)
+from traitlets import Unicode
+from tornado.queues import Queue
+import asyncio
 
 
 class AsyncGUIKernel(IPythonKernel):
@@ -13,153 +22,189 @@ class AsyncGUIKernel(IPythonKernel):
         'when other cells are running.'
     )
 
-    # Since this is not explicitly defined in the parent class
-    comm_msg_types = [ 'comm_msg' ]
+    # Types of messages to push into alternative channels.
+    # Default channel is 0.
+    msg_type_channels = dict(
+        comm_msg = 1)
+
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.log = self.log.getChild('AsyncGUIKernel')
         self.log.setLevel(logging.INFO)
-        #self.log.addHandler(logging.StreamHandler(sys.__stderr__))
+
+
+    def _get_channels(self):
+        return set([0] + list(self.msg_type_channels.values()))
+
+
+    def start(self):
+        super().start()
+        self.msg_queues = {k: Queue() for k in self._get_channels()}
+
+        # a dirty hack to make `self.enter_eventloop` work with multiple queues
+        setattr(self.msg_queue, 'qsize', lambda: any(map(Queue.qsize, self.msg_queues)))
+
 
     def _parse_message(self, msg) -> Tuple[Any, dict]:
         """dispatch control requests"""
         idents, msg = self.session.feed_identities(msg, copy=False)
         try:
-            msg = self.session.deserialize(msg, content=True, copy=False)
+            msg = self.session.deserialize(msg, content=False, copy=False)
             return (idents, msg)
         except:
             self.log.error("Invalid Message", exc_info=True)
             return
 
-    @gen.coroutine
-    def dispatch_shell(self, stream, msg: dict, idents):
-        """dispatch shell requests"""
-        # Set the parent message for side effects.
-        self.set_parent(idents, msg)
-        self._publish_status('busy')
 
-        if self._aborting:
-            self._send_abort_reply(stream, msg, idents)
-            self._publish_status('idle')
-            # flush to ensure reply is sent before
-            # handling the next request
-            stream.flush(zmq.POLLOUT)
-            return
-
-        msg_type = msg['header']['msg_type']
-
-        # Print some info about this message and leave a '--->' marker, so it's
-        # easier to trace visually the message chain when debugging.  Each
-        # handler prints its message at the end.
-        self.log.debug('\n*** MESSAGE TYPE:%s***', msg_type)
-        self.log.debug('   Content: %s\n   --->\n   ', msg['content'])
-
-        if not self.should_handle(stream, msg, idents):
-            return
-
-        handler = self.shell_handlers.get(msg_type, None)
-        if handler is None:
-            self.log.warning("Unknown message type: %r", msg_type)
-        else:
-            self.log.debug("%s: %s", msg_type, msg)
-            try:
-                self.pre_handler_hook()
-            except Exception:
-                self.log.debug("Unable to signal in pre_handler_hook:", exc_info=True)
-            try:
-                yield gen.maybe_future(handler(stream, idents, msg))
-            except Exception:
-                self.log.error("Exception in message handler:", exc_info=True)
-            finally:
-                try:
-                    self.post_handler_hook()
-                except Exception:
-                    self.log.debug("Unable to signal in post_handler_hook:", exc_info=True)
-
-        sys.stdout.flush()
-        sys.stderr.flush()
-        self._publish_status('idle')
-        # flush to ensure reply is sent before
-        # handling the next request
-        stream.flush(zmq.POLLOUT)
-
-    @gen.coroutine
-    def dispatch_control(self, msg: dict, idents):
-        self.log.debug("Control received: %s", msg)
-
-        # Set the parent message for side effects.
-        self.set_parent(idents, msg)
-        self._publish_status('busy')
-        if self._aborting:
-            self._send_abort_reply(self.control_stream, msg, idents)
-            self._publish_status('idle')
-            return
-
-        header = msg['header']
-        msg_type = header['msg_type']
-
-        handler = self.control_handlers.get(msg_type, None)
-        if handler is None:
-            self.log.error("UNKNOWN CONTROL MESSAGE TYPE: %r", msg_type)
-        else:
-            try:
-                yield gen.maybe_future(handler(self.control_stream, idents, msg))
-            except Exception:
-                self.log.error("Exception in control handler:", exc_info=True)
-
-        sys.stdout.flush()
-        sys.stderr.flush()
-        self._publish_status('idle')
-        # flush to ensure reply is sent
-        self.control_stream.flush(zmq.POLLOUT)
-
-    def schedule_dispatch(self, priority, dispatch, *args):
+    def schedule_dispatch(self, dispatch, *args):
         """
         Changes the schedule_dispatch dispatch method to
         always dispatch comm events.
         """
 
-        # Only dispatch_shell messages have two args
-        if len(args) == 2:
-            stream, unparsed_msg = args
-            indent, msg = self._parse_message(unparsed_msg)
-            new_args = (stream, msg, indent)
-        elif len(args) == 1:
-            # One arg
-            (unparsed_msg,) = args
-            indent, msg = self._parse_message(unparsed_msg)
-            new_args = (msg, indent)
-        elif len(args) == 0:
-            new_args = args
+        idx = next(self._message_counter)
+        channel = 0
 
-        if new_args and msg['header']['msg_type'] in self.comm_msg_types:
-            return self.io_loop.add_callback(dispatch, *new_args)
-        else:
-            idx = next(self._message_counter)
+        if len(args) >= 1:
+            indent, msg = self._parse_message(args[0])
+            msg_type = (msg.get('header', dict()).get('msg_type', ''))
+            channel = self.msg_type_channels.get(msg_type, 0)
 
-            self.msg_queue.put_nowait(
-                (
-                    priority,
-                    idx,
-                    dispatch,
-                    new_args,
-                )
+        self.msg_queues[channel].put_nowait(
+            (
+                idx,
+                dispatch,
+                args,
             )
-            # ensure the eventloop wakes up
-            self.io_loop.add_callback(lambda: None)
+        )
 
-    def set_parent(self, ident, parent):
-        # The last message sent will set what cell output
-        # to use. We want to the awaiting future to print
-        # it's own output, not the cell which the comm is
-        # associated with.
+        # ensure the eventloop wakes up
+        self.io_loop.add_callback(lambda: None)
+
+
+    async def _process_one_immediately(self):
+        # Pick a request from any channel and exit
+        msg = None
+        for k in self._get_channels():
+            try:
+                msg =  self.msg_queues[i].get_nowait()
+                break
+            except (asyncio.QueueEmpty, QueueEmpty):
+                pass
+
+        t, dispatch, args = msg
+        await dispatch(*args)
+
+
+    async def _fetch_request(self, channel):
+        t, dispatch, args = await self.msg_queues[channel].get()
+        return dispatch(*args)
+
+
+    def _fill_requests(self, channels):
+        return {
+            asyncio.create_task(self._fetch_request(channel)): channel
+            for channel in channels}
+
+
+    async def process_one(self, wait=True):
+        """Process 'one' request
+
+        Returns None if no message was handled.
+
+        While the first request is being processed it also processes requests in
+        another channels.
+        """
+
+        if not wait:
+            return self._process_one_immediately()
+
+
+        # Here we do the following things:
+        # - await on all message queues for a new request
+        # - as soon as we get a request we await on it (along with the remaining message queues)
+        # - as soon as we process the request we await on it's message queue again
+        #
+        # When we finish processing all the requests and return to awaiting on all channels again, we exit.
+        # If we use single message queue we process exactly one request.
+        # If we use more queues, we might process multiple requests in one go.
+
+        channels = self._get_channels()
+        requests = self._fill_requests(channels)
+        workers = {}
+
+        while True:
+            done, pending = await asyncio.wait(
+                list(requests.keys()) + list(workers.keys()),
+                return_when = asyncio.FIRST_COMPLETED)
+
+            for t in done:
+                if t in requests:
+                    workers[asyncio.create_task(t.result())] = requests[t]
+
+            requests = {k: v for k, v in requests.items() if k not in done}
+            workers = {k: v for k, v in workers.items() if k not in done}
+
+            if len(workers) == 0:
+                for t in requests.keys():
+                    t.cancel()
+                break
+
+            requests.update(
+                self._fill_requests(
+                    channels - set(workers.values()) - set(requests.values())))
+
+
+    def set_parent(self, ident, parent, channel="shell"):
+        """Overridden from parent to tell the display hook and output streams
+        about the parent message.
+        """
 
         # Don't change the output if the message is from a comm
-        #if parent['header']['msg_type'] not in self.comm_msg_types:
-        super().set_parent(ident, parent)
+        if parent['header']['msg_type'] not in self.msg_type_channels:
+            super().set_parent(ident, parent, channel)
+            if channel == "shell":
+                self.shell.set_parent(parent)
+
+
+default_display_name = "Async GUI Python %i (asyng_gui_ipython_kernel)" % sys.version_info[0]
+
+
+def custom_get_kernel_dict(extra_arguments=None):
+    return {
+        "argv": make_ipkernel_cmd('async_gui_ipython_kernel', extra_arguments=extra_arguments),
+        "display_name": default_display_name,
+        "language": "python",
+        "metadata": {"debugger": _is_debugpy_available}}
+
+# Monkey patching `get_kernel_dict` to use custom `mod``
+kernelspec.get_kernel_dict = custom_get_kernel_dict
+
+
+class InstallAsyncGUIKernelSpecApp(InstallIPythonKernelSpecApp):
+    name = Unicode("async-gui-ipython-kernel-install")
+
+    def initialize(self, argv=None):
+        super().initialize(argv)
+
+        default_argv = {
+            '--name': 'async-gui-' + kernelspec.KERNEL_NAME,
+            '--display-name': default_display_name}
+
+        for k, v in default_argv.items():
+            if k not in self.argv:
+                self.argv += [k, v]
+
+
+class AsyncGUIKernelApp(IPKernelApp):
+    name = Unicode('async-gui-ipython-kernel')
+
+    subcommands = {
+        "install": (
+            "async_gui_ipython_kernel.InstallAsyncGUIKernelSpecApp",
+            "Install the IPython kernel")}
 
 
 if __name__ == '__main__':
-    from ipykernel.kernelapp import IPKernelApp
-    IPKernelApp.launch_instance(kernel_class=AsyncGUIKernel)
+    AsyncGUIKernelApp.launch_instance(kernel_class = AsyncGUIKernel)

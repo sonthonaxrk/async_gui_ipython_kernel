@@ -11,7 +11,7 @@ setup(
         'while the IPython kernel is processing a cell'
     ),
     install_requires=[
-        'ipykernel'
+        'ipykernel>=5.6.0'
     ],
     setup_requires=[
         'jupyter_client'
